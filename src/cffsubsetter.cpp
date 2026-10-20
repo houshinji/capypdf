@@ -49,7 +49,11 @@ namespace capypdf::internal {
 
 namespace {
 
-const int32_t NUM_STANDARD_STRINGS = 390;
+// String ids below this are not stored in the font.
+const int32_t NUM_STANDARD_STRINGS = 391;
+
+const char registry_str[] = "Adobe";
+const char ordering_str[] = "Identity";
 
 rvoe<std::span<std::byte>>
 safe_subspan(const std::span<std::byte> &span, size_t offset, size_t size) {
@@ -341,8 +345,12 @@ void print_info(const CFFont &cff) {
 
 std::vector<uint32_t> append_index_to(std::vector<std::byte> &output, const CFFIndex &index) {
     swap_and_append_bytes<uint16_t>(output, index.size());
-    output.push_back(std::byte{4});
     std::vector<uint32_t> offsets;
+    if(index.entries.empty()) {
+        // An empty index is only the count.
+        return offsets;
+    }
+    output.push_back(std::byte{4});
     uint32_t offset = 1;
     for(const auto &e : index.entries) {
         swap_and_append_bytes(output, offset);
@@ -551,9 +559,6 @@ rvoe<CFFont> parse_cff_data(DataSource source) {
     } else {
         f.is_cid = false;
     }
-    if(!f.is_cid) {
-        append_ros_strings(f);
-    }
     if(f.is_cid) {
         if(!fda || fda->operand.empty()) {
             RETERR(UnsupportedFormat);
@@ -575,18 +580,6 @@ rvoe<CFFont> parse_cff_data(DataSource source) {
         f.fdselect = std::move(fdsstr);
     }
     return f;
-}
-
-static const char registry_str[] = "Adobe";
-static const char ordering_str[] = "Identity";
-
-void append_ros_strings(CFFont &f) {
-    assert(!f.is_cid);
-    // Add two string needed to specify ROS values.
-    std::span<std::byte> registry((std::byte *)registry_str, strlen(registry_str));
-    f.string.entries.push_back(registry);
-    std::span<std::byte> ordering((std::byte *)ordering_str, strlen(ordering_str));
-    f.string.entries.push_back(ordering);
 }
 
 uint8_t CFFont::get_fontdict_id(uint16_t glyph_id) const {
@@ -640,12 +633,15 @@ CFFWriter::CFFWriter(const CFFont &source_, const std::vector<SubsetGlyphs> &sub
 }
 
 rvoe<NoReturnValue> CFFWriter::create() {
+    collect_strings();
     uint8_t header[4] = {1, 0, 4, 4};
     output.assign((std::byte *)header, (std::byte *)header + 4);
     append_index(source.name);
 
-    create_topdict();
-    append_index(source.string);
+    ERCV(create_topdict());
+    CFFIndex string_index;
+    string_index.entries = strings;
+    append_index(string_index);
     append_index(source.global_subr);
     fixups.charsets.value = output.size();
     append_charset();
@@ -657,6 +653,91 @@ rvoe<NoReturnValue> CFFWriter::create() {
     //  private
     //  local subr
     RETOK;
+}
+
+// The strings are indexed from the first nonstandard one.
+int32_t CFFWriter::string_id(std::string_view s) {
+    for(size_t i = 0; i < strings.size(); ++i) {
+        if(span2sv(strings[i]) == s) {
+            return NUM_STANDARD_STRINGS + (int32_t)i;
+        }
+    }
+    // The span points to the data of a string literal.
+    strings.emplace_back((std::byte *)const_cast<char *>(s.data()), s.size());
+    return NUM_STANDARD_STRINGS + (int32_t)strings.size() - 1;
+}
+
+void CFFWriter::collect_strings() {
+    strings = source.string.entries;
+    // Needed for the character collection (ROS) of the output. See create_topdict.
+    string_id(registry_str);
+    string_id(ordering_str);
+}
+
+rvoe<NoReturnValue> CFFWriter::create_topdict() {
+    CFFDictWriter topdict;
+
+    // The glyphs of the output are numbered from zero and also have their position as the CID.
+    // This is the same as the identity mapping between CIDs and glyph ids
+    // that is used in the PDF, whatever character collection the source belongs to.
+    CFFDictItem ros;
+    ros.opr = DictOperator::ROS;
+    ros.operand.push_back(string_id(registry_str));
+    ros.operand.push_back(string_id(ordering_str));
+    ros.operand.push_back(0);
+    topdict.append_command(ros);
+
+    copy_dict_item_if_exists(topdict, DictOperator::Notice);
+    copy_dict_item_if_exists(topdict, DictOperator::FullName);
+    copy_dict_item_if_exists(topdict, DictOperator::FamilyName);
+    copy_dict_item_if_exists(topdict, DictOperator::Weight);
+    copy_dict_item_if_exists(topdict, DictOperator::FontBBox);
+    // Without this a font whose glyphs are not defined in units of 1/1000 em
+    // (such as one with 2048 units per em) is rendered at the wrong size.
+    copy_dict_item_if_exists(topdict, DictOperator::FontMatrix);
+    if(source.is_cid) {
+        copy_dict_item_if_exists(topdict, DictOperator::CIDFontVersion);
+        copy_dict_item_if_exists(topdict, DictOperator::CIDFontRevision);
+    }
+    int32_t cid_count = 0;
+    if(auto *cc = find_command(source, DictOperator::CIDCount);
+       source.is_cid && cc && cc->operand.size() == 1) {
+        cid_count = cc->operand.front();
+    }
+    topdict.append_command({std::max<int32_t>(cid_count, (int32_t)sub.size())},
+                           DictOperator::CIDCount);
+
+    // The offsets of the following are not known yet. They are written with a fixed number of
+    // bytes so they can be replaced when the data has been laid out.
+    // The first byte of an operand is its type.
+    const std::vector<int32_t> placeholder{-1};
+    const size_t fdarray_pos = topdict.current_size() + 1;
+    topdict.append_command(placeholder, DictOperator::FDArray);
+    const size_t fdselect_pos = topdict.current_size() + 1;
+    topdict.append_command(placeholder, DictOperator::FDSelect);
+    const size_t charset_pos = topdict.current_size() + 1;
+    topdict.append_command(placeholder, DictOperator::Charset);
+    const size_t charstrings_pos = topdict.current_size() + 1;
+    topdict.append_command(placeholder, DictOperator::CharStrings);
+
+    auto serialization = topdict.steal();
+    std::vector<std::vector<std::byte>> wrapper{std::move(serialization.output)};
+    auto offsets = append_index(wrapper);
+    assert(offsets.size() == 1);
+    const auto dict_start = offsets.front();
+    fixups.fdarray.offset = fdarray_pos + dict_start;
+    fixups.fdselect.offset = fdselect_pos + dict_start;
+    fixups.charsets.offset = charset_pos + dict_start;
+    fixups.charstrings.offset = charstrings_pos + dict_start;
+    RETOK;
+}
+
+void CFFWriter::copy_dict_item_if_exists(CFFDictWriter &w, DictOperator op) {
+    auto *e = find_command(source, op);
+    if(e) {
+        // Copied as is, as it may contain real numbers.
+        w.append_command(*e);
+    }
 }
 
 void CFFWriter::append_fdthings() {
@@ -780,92 +861,6 @@ void CFFWriter::write_fix(const OffsetPatch &p) {
     const uint32_t value = std::byteswap(p.value);
     assert(p.offset + sizeof(uint32_t) < output.size());
     memcpy(output.data() + p.offset, &value, sizeof(uint32_t));
-}
-
-rvoe<NoReturnValue> CFFWriter::create_topdict() {
-    CFFDictWriter topdict;
-
-    if(source.is_cid) {
-        ERCV(copy_dict_item(topdict, DictOperator::ROS));
-    } else {
-        CFFDictItem ros;
-        ros.opr = DictOperator::ROS;
-        ros.operand.push_back(391 + source.string.size() - 2);
-        ros.operand.push_back(391 + source.string.size() - 1);
-        ros.operand.push_back(0);
-        topdict.append_command(ros);
-    }
-    copy_dict_item_if_exists(topdict, DictOperator::Notice);
-    copy_dict_item_if_exists(topdict, DictOperator::FullName);
-    copy_dict_item_if_exists(topdict, DictOperator::FamilyName);
-    copy_dict_item_if_exists(topdict, DictOperator::Weight);
-    copy_dict_item_if_exists(topdict, DictOperator::FontBBox);
-    // Without this a font whose glyphs are not defined in units of 1/1000 em
-    // (such as one with 2048 units per em) is rendered at the wrong size.
-    copy_dict_item_if_exists(topdict, DictOperator::FontMatrix);
-    if(source.is_cid) {
-        ERCV(copy_dict_item(topdict, DictOperator::CIDFontVersion));
-        ERCV(copy_dict_item(topdict, DictOperator::CIDCount));
-        ERCV(copy_dict_item(topdict, DictOperator::FDArray));  // offset needs to be fixed in post.
-        ERCV(copy_dict_item(topdict, DictOperator::FDSelect)); // offset needs to be fixed in post.
-    } else {
-        std::vector<int32_t> operand;
-        operand.push_back(-1);
-        topdict.append_command(operand, DictOperator::CIDFontVersion);
-        operand.clear();
-        operand.push_back(65535);
-        topdict.append_command(operand, DictOperator::CIDCount);
-        operand.clear();
-        operand.push_back(-1);
-        topdict.append_command(operand, DictOperator::FDArray);
-        topdict.append_command(operand, DictOperator::FDSelect);
-    }
-    ERCV(copy_dict_item(topdict, DictOperator::Charset)); // offset needs to be fixed in post.
-    ERCV(copy_dict_item(topdict,
-                        DictOperator::CharStrings)); // offset needs to be fixed in post.
-    // copy_dict_item(topdict, DictOperator::UnderlinePosition);
-    auto serialization = topdict.steal();
-    std::vector<std::vector<std::byte>> wrapper{std::move(serialization.output)};
-    auto offsets = append_index(wrapper);
-    assert(offsets.size() == 1);
-    const auto dict_start = offsets.front();
-    fixups.fdarray.offset = serialization.offsets.at(8) + 1 + dict_start;
-    fixups.fdselect.offset = serialization.offsets.at(9) + 1 + dict_start;
-    fixups.charsets.offset = serialization.offsets.at(10) + 1 + dict_start;
-    fixups.charstrings.offset = serialization.offsets.at(11) + 1 + dict_start;
-
-    /*
-    uint32_t sanity_check_be;
-    memcpy(&sanity_check_be, output.data() + fixups.fdarray.offset, sizeof(sanity_check_be));
-    const auto written_value = std::byteswap(sanity_check_be);
-    const auto original_value = find_command(source, DictOperator::FDArray)->operand.front();
-    const auto original_swapped = std::byteswap(original_value);
-    auto loc = std::search(output.begin(),
-                           output.end(),
-                           (std::byte *)&original_swapped,
-                           (std::byte *)&original_swapped + 4);
-    assert(loc != output.end());
-    const auto real_offset = std::distance(output.begin(), loc);
-    assert(written_value == original_value);
-    */
-    RETOK;
-}
-
-rvoe<NoReturnValue> CFFWriter::copy_dict_item(CFFDictWriter &w, DictOperator op) {
-    auto *e = find_command(source, op);
-    if(!e) {
-        RETERR(MissingCFFDictItem);
-    }
-    w.append_command(e->operand, e->opr);
-    RETOK;
-}
-
-void CFFWriter::copy_dict_item_if_exists(CFFDictWriter &w, DictOperator op) {
-    auto *e = find_command(source, op);
-    if(e) {
-        // Copied as is, as it may contain real numbers.
-        w.append_command(*e);
-    }
 }
 
 std::vector<uint32_t> CFFWriter::append_index(const CFFIndex &index) {

@@ -169,7 +169,6 @@ struct CFFont {
 
 rvoe<CFFont> parse_cff_file(const char *fname);
 rvoe<CFFont> parse_cff_data(DataSource original_data);
-void append_ros_strings(CFFont &f);
 
 struct SubsetGlyphs {
     uint32_t codepoint; // unicode
@@ -201,6 +200,11 @@ private:
     DictOutput o;
 };
 
+// Writes a CID keyed CFF font that has only the given glyphs. Glyph number N of the
+// output is the glyph `sub[N].gid` of the source, and its CID is also N. The first one
+// must be the .notdef glyph.
+//
+// The source can be either a CID keyed or a name keyed font.
 class CFFWriter {
 public:
     CFFWriter(const CFFont &source, const std::vector<SubsetGlyphs> &sub);
@@ -216,8 +220,9 @@ private:
     void append_charstrings();
     void append_fdthings();
 
+    void collect_strings();
+    int32_t string_id(std::string_view s);
     rvoe<NoReturnValue> create_topdict();
-    rvoe<NoReturnValue> copy_dict_item(CFFDictWriter &w, DictOperator op);
     void copy_dict_item_if_exists(CFFDictWriter &w, DictOperator op);
 
     void patch_offsets();
@@ -227,6 +232,9 @@ private:
     const std::vector<SubsetGlyphs> &sub;
     std::vector<std::byte> output;
     Fixups fixups;
+
+    // Strings of the output font. The ones of the source plus whatever we need.
+    std::vector<std::span<std::byte>> strings;
 };
 
 } // namespace capypdf::internal
