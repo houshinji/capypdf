@@ -306,6 +306,82 @@ class TestPDFCreation(unittest.TestCase):
                 ctx.cmd_j(capypdf.LineJoinStyle.Round)
                 ctx.cmd_S()
 
+    @cleanup('cjk_subset.pdf')
+    def test_cjk_subset(self, ofilename):
+        # The CFF fonts for CJK languages are huge. Only the glyphs that are used,
+        # and none of the subroutines that are shared between all glyphs, should be embedded.
+        import re, zlib
+
+        def read_index(data, pos):
+            count = int.from_bytes(data[pos:pos + 2], 'big')
+            if count == 0:
+                return [], pos + 2
+            offsize = data[pos + 2]
+            offsets = [int.from_bytes(data[pos + 3 + i * offsize:pos + 3 + (i + 1) * offsize], 'big')
+                       for i in range(count + 1)]
+            base = pos + 3 + (count + 1) * offsize - 1
+            return [data[base + offsets[i]:base + offsets[i + 1]] for i in range(count)], base + offsets[-1]
+
+        def charstrings_offset(dictdata):
+            operands = []
+            i = 0
+            while i < len(dictdata):
+                b0 = dictdata[i]
+                if b0 <= 21:
+                    if b0 == 17:
+                        return operands[-1]
+                    i += 2 if b0 == 12 else 1
+                    operands = []
+                elif b0 == 28:
+                    operands.append(int.from_bytes(dictdata[i + 1:i + 3], 'big', signed=True))
+                    i += 3
+                elif b0 == 29:
+                    operands.append(int.from_bytes(dictdata[i + 1:i + 5], 'big', signed=True))
+                    i += 5
+                elif b0 == 30:
+                    # Real number. Skip until the end marker.
+                    i += 1
+                    while dictdata[i] & 0xf != 0xf and dictdata[i] >> 4 != 0xf:
+                        i += 1
+                    i += 1
+                    operands.append(0)
+                elif b0 <= 246:
+                    operands.append(b0 - 139)
+                    i += 1
+                else:
+                    operands.append(0)
+                    i += 2
+            self.fail('No CharStrings in the top dict.')
+
+        text = '日本語のテキスト'
+        w, h = 200, 200
+        dprops = capypdf.DocumentProperties()
+        pprops = capypdf.PageProperties()
+        pprops.set_pagebox(capypdf.PageBox.Media, 0, 0, w, h)
+        dprops.set_default_page_properties(pprops)
+        with capypdf.Generator(ofilename, dprops) as g:
+            fid = g.load_font(font_dir / 'NotoSerifCJK-Bold.ttc')
+            with g.page_draw_context() as ctx:
+                ctx.render_text(text, fid, 18, 10, 100)
+        pdf = pathlib.Path(ofilename).read_bytes()
+        # The complete font is more than a megabyte.
+        self.assertLess(len(pdf), 20000)
+        m = re.search(rb'/Length (\d+)\s*/Filter /FlateDecode\s*/Subtype /CIDFontType0C\s*>>\s*stream\n', pdf)
+        self.assertIsNotNone(m, 'Font file not found.')
+        cff = zlib.decompress(pdf[m.end():m.end() + int(m.group(1))])
+        self.assertEqual(cff[0:2], b'\x01\x00')
+        names, pos = read_index(cff, cff[2])
+        topdicts, pos = read_index(cff, pos)
+        strings, pos = read_index(cff, pos)
+        global_subrs, pos = read_index(cff, pos)
+        self.assertEqual(len(names), 1)
+        self.assertEqual(len(topdicts), 1)
+        self.assertEqual(len(global_subrs), 0)
+        charstrings, _ = read_index(cff, charstrings_offset(topdicts[0]))
+        # One glyph for each different character, and .notdef.
+        self.assertEqual(len(charstrings), len(set(text)) + 1)
+        self.assertLess(len(cff), 10000)
+
     @validate_image('python_shaping', 200, 200)
     def test_shaping(self, ofilename, w, h):
         dprops = capypdf.DocumentProperties()

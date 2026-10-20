@@ -343,6 +343,13 @@ void print_info(const CFFont &cff) {
     print_string_for_operator(cff, DictOperator::Weight);
 }
 
+void append_offset(std::vector<std::byte> &output, uint32_t value, int offsize) {
+    for(int i = offsize - 1; i >= 0; --i) {
+        output.push_back(std::byte((value >> (8 * i)) & 0xFF));
+    }
+}
+
+// Returns the positions in the output where the entries start.
 std::vector<uint32_t> append_index_to(std::vector<std::byte> &output, const CFFIndex &index) {
     swap_and_append_bytes<uint16_t>(output, index.size());
     std::vector<uint32_t> offsets;
@@ -350,13 +357,26 @@ std::vector<uint32_t> append_index_to(std::vector<std::byte> &output, const CFFI
         // An empty index is only the count.
         return offsets;
     }
-    output.push_back(std::byte{4});
+    uint64_t total_size = 1; // Offsets start from one.
+    for(const auto &e : index.entries) {
+        total_size += e.size_bytes();
+    }
+    // The offset array is as compact as the sizes permit.
+    int offsize = 4;
+    if(total_size <= 0xFF) {
+        offsize = 1;
+    } else if(total_size <= 0xFFFF) {
+        offsize = 2;
+    } else if(total_size <= 0xFFFFFF) {
+        offsize = 3;
+    }
+    output.push_back(std::byte(offsize));
     uint32_t offset = 1;
     for(const auto &e : index.entries) {
-        swap_and_append_bytes(output, offset);
+        append_offset(output, offset, offsize);
         offset += e.size_bytes();
     }
-    swap_and_append_bytes(output, offset);
+    append_offset(output, offset, offsize);
     for(const auto &e : index.entries) {
         offsets.push_back(output.size());
         append_bytes(output, e);
@@ -407,7 +427,10 @@ rvoe<CFFFontDict> load_fdarray_entry(std::span<std::byte> dataspan, std::span<st
     return fdict;
 }
 
-size_t write_private_dict(std::vector<std::byte> &output, const CFFPrivateDict &pd) {
+// Writes the private dict followed by its local subroutines, if any are wanted.
+// Returns the size of the dictionary.
+size_t
+write_private_dict(std::vector<std::byte> &output, const CFFPrivateDict &pd, bool include_subrs) {
     CFFDictWriter w;
     for(const auto &e : pd.entries.entries) {
         const auto opr = e.opr;
@@ -417,7 +440,8 @@ size_t write_private_dict(std::vector<std::byte> &output, const CFFPrivateDict &
         }
         w.append_command(e);
     }
-    if(pd.subr) {
+    const bool write_subrs = include_subrs && pd.subr;
+    if(write_subrs) {
         // This is always last, so we know the layout.
         CFFDictItem e;
         e.operand.push_back(w.current_size() + 1 + 4 + 1);
@@ -426,33 +450,10 @@ size_t write_private_dict(std::vector<std::byte> &output, const CFFPrivateDict &
     }
     auto bytes = w.steal();
     output.insert(output.end(), bytes.output.cbegin(), bytes.output.cend());
-    if(pd.subr) {
+    if(write_subrs) {
         append_index_to(output, pd.subr.value());
     }
     return bytes.output.size();
-}
-
-std::vector<CFFSelectRange3> build_fdselect3(const CFFont &source,
-                                             const std::vector<SubsetGlyphs> &sub) {
-    std::vector<CFFSelectRange3> result;
-    result.reserve(10);
-    if(source.is_cid) {
-        result.emplace_back(0, source.get_fontdict_id(0));
-        for(size_t i = 1; i < sub.size(); ++i) {
-            const auto &sg = sub[i];
-            const auto sg_fd = source.get_fontdict_id(sg.gid);
-            if(sg_fd != result.back().fd) {
-                result.emplace_back((uint16_t)i, sg_fd);
-            }
-        }
-    } else {
-        // If the source is not in CID format, then in the output
-        // CID format all glyphs use the same private dictionary.
-        for(size_t i = 0; i < sub.size(); ++i) {
-            result.emplace_back((uint16_t)i, 0);
-        }
-    }
-    return result;
 }
 
 } // namespace
@@ -597,6 +598,17 @@ uint8_t CFFont::get_fontdict_id(uint16_t glyph_id) const {
     return std::prev(it)->fd;
 }
 
+const CFFIndex *CFFont::local_subrs(uint8_t fontdict_id) const {
+    if(!is_cid) {
+        return pdict.subr ? &pdict.subr.value() : nullptr;
+    }
+    if(fontdict_id >= fdarray.size()) {
+        return nullptr;
+    }
+    const auto &fd = fdarray[fontdict_id];
+    return fd.priv && fd.priv->subr ? &fd.priv->subr.value() : nullptr;
+}
+
 rvoe<CFFont> parse_cff_file(const char *fname) {
     ERC(source, mmap_file(fname));
     return parse_cff_data(std::move(source));
@@ -627,13 +639,253 @@ void CFFDictWriter::append_command(const std::vector<int32_t> &operands, DictOpe
     o.output.push_back(std::byte((uint16_t)op & 0xFF));
 }
 
+namespace {
+
+// Interprets Type 2 charstrings only far enough to be able to copy them while replacing
+// the subroutine calls with the called code. The operators are described in
+// Adobe Technical Note #5177.
+class CharstringExpander {
+public:
+    CharstringExpander(const CFFIndex &global_subrs,
+                       const CFFIndex *local_subrs,
+                       std::vector<std::byte> &result)
+        : global_subrs{global_subrs}, local_subrs{local_subrs}, out{result} {}
+
+    bool run(std::span<const std::byte> code, int depth);
+
+private:
+    // An operand that has been pushed to the stack and written to the output.
+    struct Operand {
+        bool is_integer;
+        int32_t value;
+        size_t out_start; // Where its bytes are in the output.
+        size_t out_end;
+    };
+
+    // Subroutine numbers are stored relative to a bias that depends on the number of subroutines.
+    static int64_t bias(size_t num_subrs) {
+        if(num_subrs < 1240) {
+            return 107;
+        }
+        if(num_subrs < 33900) {
+            return 1131;
+        }
+        return 32768;
+    }
+
+    bool call(const CFFIndex *subrs, int depth);
+
+    // Limits that stop broken fonts, such as ones where a subroutine calls itself,
+    // from consuming all resources. Real glyphs are nowhere near these.
+    static constexpr int max_depth = 32;
+    static constexpr size_t max_stack = 513;
+    static constexpr size_t max_output = 4 * 1024 * 1024;
+
+    const CFFIndex &global_subrs;
+    const CFFIndex *local_subrs;
+    std::vector<std::byte> &out;
+    std::vector<Operand> stack;
+    // The number of stem hints so far, needed to know the size of the mask of
+    // a hintmask operator. They can be declared in a different subroutine than the mask.
+    size_t num_stems = 0;
+    int calls_left = 100000;
+    bool done = false; // Endchar has been seen.
+};
+
+bool CharstringExpander::call(const CFFIndex *subrs, int depth) {
+    if(!subrs || stack.empty()) {
+        return false;
+    }
+    // The number of the subroutine is the previous operand. Unless it is one
+    // that can just be dropped (it is the last thing that was written), we don't know it.
+    const Operand top = stack.back();
+    if(!top.is_integer || top.out_end != out.size()) {
+        return false;
+    }
+    const int64_t index = (int64_t)top.value + bias(subrs->size());
+    if(index < 0 || index >= (int64_t)subrs->size()) {
+        return false;
+    }
+    if(depth >= max_depth || calls_left <= 0) {
+        return false;
+    }
+    --calls_left;
+    stack.pop_back();
+    out.resize(top.out_start);
+    return run(subrs->entries[index], depth + 1);
+}
+
+bool CharstringExpander::run(std::span<const std::byte> code, int depth) {
+    size_t i = 0;
+    const size_t n = code.size();
+    while(i < n && !done) {
+        if(out.size() > max_output) {
+            return false;
+        }
+        const uint8_t b0 = (uint8_t)code[i];
+        if(b0 >= 32 || b0 == 28) {
+            // An operand.
+            size_t len = 1;
+            int32_t value = 0;
+            bool is_integer = true;
+            if(b0 == 28) {
+                len = 3;
+                if(i + len > n) {
+                    return false;
+                }
+                value = (int16_t)(((uint8_t)code[i + 1] << 8) | (uint8_t)code[i + 2]);
+            } else if(b0 <= 246) {
+                value = (int32_t)b0 - 139;
+            } else if(b0 <= 250) {
+                len = 2;
+                if(i + len > n) {
+                    return false;
+                }
+                value = ((int32_t)b0 - 247) * 256 + (uint8_t)code[i + 1] + 108;
+            } else if(b0 <= 254) {
+                len = 2;
+                if(i + len > n) {
+                    return false;
+                }
+                value = -((int32_t)b0 - 251) * 256 - (uint8_t)code[i + 1] - 108;
+            } else {
+                // 16.16 fixed point number.
+                len = 5;
+                is_integer = false;
+                if(i + len > n) {
+                    return false;
+                }
+            }
+            if(stack.size() >= max_stack) {
+                return false;
+            }
+            stack.push_back(Operand{is_integer, value, out.size(), out.size() + len});
+            out.insert(out.end(), code.begin() + i, code.begin() + i + len);
+            i += len;
+            continue;
+        }
+        ++i;
+        switch(b0) {
+        case 1:  // hstem
+        case 3:  // vstem
+        case 18: // hstemhm
+        case 23: // vstemhm
+            num_stems += stack.size() / 2;
+            stack.clear();
+            out.push_back(std::byte(b0));
+            break;
+        case 19:   // hintmask
+        case 20: { // cntrmask
+            // If there are operands, they are the arguments of an implicit vstem.
+            num_stems += stack.size() / 2;
+            stack.clear();
+            out.push_back(std::byte(b0));
+            const size_t mask_size = (num_stems + 7) / 8;
+            if(i + mask_size > n) {
+                return false;
+            }
+            out.insert(out.end(), code.begin() + i, code.begin() + i + mask_size);
+            i += mask_size;
+            break;
+        }
+        case 4:  // vmoveto
+        case 5:  // rlineto
+        case 6:  // hlineto
+        case 7:  // vlineto
+        case 8:  // rrcurveto
+        case 21: // rmoveto
+        case 22: // hmoveto
+        case 24: // rcurveline
+        case 25: // rlinecurve
+        case 26: // vvcurveto
+        case 27: // hhcurveto
+        case 30: // vhcurveto
+        case 31: // hvcurveto
+            stack.clear();
+            out.push_back(std::byte(b0));
+            break;
+        case 10: // callsubr
+            if(!call(local_subrs, depth)) {
+                return false;
+            }
+            break;
+        case 29: // callgsubr
+            if(!call(&global_subrs, depth)) {
+                return false;
+            }
+            break;
+        case 11: // return
+            return true;
+        case 14: // endchar
+            if(stack.size() >= 4) {
+                // The deprecated form that draws an accented character by
+                // combining two other glyphs that are specified by number. We don't
+                // know what those glyphs are and so can't make sure they exist.
+                return false;
+            }
+            stack.clear();
+            out.push_back(std::byte(b0));
+            done = true;
+            break;
+        case 12: { // Two byte operators.
+            if(i >= n) {
+                return false;
+            }
+            const uint8_t b1 = (uint8_t)code[i++];
+            switch(b1) {
+            case 0:  // dotsection (deprecated)
+            case 34: // hflex
+            case 35: // flex
+            case 36: // hflex1
+            case 37: // flex1
+                stack.clear();
+                out.push_back(std::byte(b0));
+                out.push_back(std::byte(b1));
+                break;
+            default:
+                // Arithmetic and storage operators. They can make the numbers of the
+                // subroutines unknown. No real font seems to use them.
+                return false;
+            }
+            break;
+        }
+        default:
+            // Reserved operators.
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+bool expand_charstring_subroutines(std::span<const std::byte> charstring,
+                                   const CFFIndex &global_subrs,
+                                   const CFFIndex *local_subrs,
+                                   std::vector<std::byte> &result) {
+    result.clear();
+    CharstringExpander expander(global_subrs, local_subrs, result);
+    return expander.run(charstring, 0);
+}
+
 CFFWriter::CFFWriter(const CFFont &source_, const std::vector<SubsetGlyphs> &sub_)
     : source{source_}, sub{sub_} {
     output.reserve(100 * 1024);
 }
 
 rvoe<NoReturnValue> CFFWriter::create() {
+    if(sub.empty() || sub.size() > 65535) {
+        RETERR(IndexOutOfBounds);
+    }
+    for(const auto &g : sub) {
+        if(g.gid >= source.char_strings.size()) {
+            RETERR(IndexOutOfBounds);
+        }
+    }
+    ERCV(plan_fontdicts());
+    ERCV(prepare_charstrings());
     collect_strings();
+
     uint8_t header[4] = {1, 0, 4, 4};
     output.assign((std::byte *)header, (std::byte *)header + 4);
     append_index(source.name);
@@ -642,16 +894,67 @@ rvoe<NoReturnValue> CFFWriter::create() {
     CFFIndex string_index;
     string_index.entries = strings;
     append_index(string_index);
-    append_index(source.global_subr);
+    if(keep_subrs) {
+        append_index(source.global_subr);
+    } else {
+        append_index(CFFIndex{});
+    }
     fixups.charsets.value = output.size();
     append_charset();
     fixups.charstrings.value = output.size();
     append_charstrings();
     append_fdthings();
     patch_offsets();
-    //  encodings
-    //  private
-    //  local subr
+    RETOK;
+}
+
+// Decides which font dictionaries of the source are needed and what their numbers are in the
+// output. The ones that no glyph uses are not written. The order stays the same.
+rvoe<NoReturnValue> CFFWriter::plan_fontdicts() {
+    used_fontdicts.clear();
+    glyph_fontdict.clear();
+    glyph_fontdict.reserve(sub.size());
+    std::vector<bool> used(256, false);
+    for(const auto &g : sub) {
+        // A font that is not in the CID format has only one font dictionary.
+        const uint8_t fd = source.get_fontdict_id(g.gid);
+        if(source.is_cid && fd >= source.fdarray.size()) {
+            RETERR(MalformedFontFile);
+        }
+        used[fd] = true;
+    }
+    std::vector<uint8_t> new_number(256, 0);
+    for(size_t fd = 0; fd < used.size(); ++fd) {
+        if(used[fd]) {
+            new_number[fd] = (uint8_t)used_fontdicts.size();
+            used_fontdicts.push_back((uint8_t)fd);
+        }
+    }
+    for(const auto &g : sub) {
+        glyph_fontdict.push_back(new_number[source.get_fontdict_id(g.gid)]);
+    }
+    RETOK;
+}
+
+// Subroutines are shared between glyphs and typically most of them are needed by glyphs that
+// are not in the subset, so the subset glyphs are rewritten not to use them.
+// If that is not possible, we have to copy all subroutines as they are.
+rvoe<NoReturnValue> CFFWriter::prepare_charstrings() {
+    keep_subrs = false;
+    expanded_charstrings.clear();
+    expanded_charstrings.reserve(sub.size());
+    for(size_t i = 0; i < sub.size(); ++i) {
+        const auto &gid = sub[i].gid;
+        const auto *local_subrs = source.local_subrs(source.get_fontdict_id(gid));
+        std::vector<std::byte> expanded;
+        if(!expand_charstring_subroutines(
+               source.char_strings.entries.at(gid), source.global_subr, local_subrs, expanded)) {
+            keep_subrs = true;
+            expanded_charstrings.clear();
+            RETOK;
+        }
+        expanded_charstrings.push_back(std::move(expanded));
+    }
     RETOK;
 }
 
@@ -746,7 +1049,8 @@ void CFFWriter::append_fdthings() {
     std::vector<size_t> privatedict_offsets;   // within the above buffer
     std::vector<size_t> privatereference_offsets; // where the correct value shall be written
     if(source.is_cid) {
-        for(const auto &source_dict : source.fdarray) {
+        for(const auto font_dict_number : used_fontdicts) {
+            const auto &source_dict = source.fdarray.at(font_dict_number);
             // Why is this so complicated you ask?
             // Because the data model is completely wacko.
             //
@@ -768,19 +1072,16 @@ void CFFWriter::append_fdthings() {
             // Any metadata that is somewhat shared
             // is copied as is so all indexes and offsets
             // work directly. Only character data is subset.
+            // The same goes for the subroutines if they are not removed.
 
             privatedict_offsets.push_back(privatedict_buffer.size());
-            size_t last_dict_size = -1;
-            if(source_dict.priv) {
-                last_dict_size = write_private_dict(privatedict_buffer, source_dict.priv.value());
-            } else {
-                last_dict_size = write_private_dict(privatedict_buffer, source.pdict);
-            }
             CFFDictWriter fdarray_dict_writer;
             for(const auto &entry : source_dict.entries.entries) {
                 fdarray_dict_writer.append_command(entry);
             }
             if(source_dict.priv) {
+                const auto last_dict_size =
+                    write_private_dict(privatedict_buffer, source_dict.priv.value(), keep_subrs);
                 privatereference_offsets.push_back(fdarray_dict_writer.current_size() + 6);
                 CFFDictItem e;
                 e.operand.push_back(last_dict_size);
@@ -798,7 +1099,7 @@ void CFFWriter::append_fdthings() {
         CFFDictWriter fdarray_dict_writer;
 
         privatedict_offsets.push_back(privatedict_buffer.size());
-        auto dict_size = write_private_dict(privatedict_buffer, source.pdict);
+        auto dict_size = write_private_dict(privatedict_buffer, source.pdict, keep_subrs);
         CFFDictItem e;
         privatereference_offsets.push_back(fdarray_dict_writer.current_size() + 6);
         // FIXME, add font name here.
@@ -835,9 +1136,15 @@ void CFFWriter::append_fdthings() {
         memcpy(output.data() + write_location, &offset_be, sizeof(int32_t));
     }
 
-    // Now fdselect using the 16 bit format 3
+    // Now fdselect using the 16 bit format 3. Consecutive glyphs
+    // that use the same font dictionary form one range.
     fixups.fdselect.value = output.size();
-    auto fdrange = build_fdselect3(source, sub);
+    std::vector<CFFSelectRange3> fdrange;
+    for(size_t i = 0; i < sub.size(); ++i) {
+        if(fdrange.empty() || fdrange.back().fd != glyph_fontdict[i]) {
+            fdrange.push_back(CFFSelectRange3{(uint16_t)i, glyph_fontdict[i]});
+        }
+    }
     assert(fdrange.size() <= 65535);
     output.push_back(std::byte(3));
     swap_and_append_bytes(output, (uint16_t)fdrange.size());
@@ -876,18 +1183,28 @@ std::vector<uint32_t> CFFWriter::append_index(const std::vector<std::vector<std:
     return append_index(converter);
 }
 
+// The glyph with the number zero is not listed. Its CID is always zero.
+// The other glyphs have their position as the CID, so the whole thing is one range.
 void CFFWriter::append_charset() {
-    output.emplace_back(std::byte(0));
-    for(uint16_t i = 1; i < sub.size(); ++i) {
-        swap_and_append_bytes(output, i);
+    if(sub.size() < 2) {
+        output.emplace_back(std::byte(0)); // Format 0 without any glyphs.
+        return;
     }
+    output.emplace_back(std::byte(2));
+    swap_and_append_bytes<uint16_t>(output, 1);
+    swap_and_append_bytes<uint16_t>(output, (uint16_t)(sub.size() - 2));
 }
 
 void CFFWriter::append_charstrings() {
     CFFIndex subdata;
     subdata.entries.reserve(sub.size());
-    for(const auto &subglyph : sub) {
-        subdata.entries.push_back(source.char_strings.entries.at(subglyph.gid));
+    for(size_t i = 0; i < sub.size(); ++i) {
+        if(keep_subrs) {
+            subdata.entries.push_back(source.char_strings.entries.at(sub[i].gid));
+        } else {
+            subdata.entries.emplace_back(expanded_charstrings[i].data(),
+                                         expanded_charstrings[i].size());
+        }
     }
     append_index(subdata);
 }
