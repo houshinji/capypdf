@@ -5,7 +5,9 @@
 #include <bitfiddling.hpp>
 #include <utils.hpp>
 
+#include <algorithm>
 #include <bit>
+#include <iterator>
 
 // clang-format off
 
@@ -91,10 +93,11 @@ rvoe<CFFIndex> load_index(std::span<std::byte> dataspan, size_t &offset) {
     CFFIndex index;
     ERC(cnt, extract<uint16_t>(dataspan, offset));
     const uint32_t count = std::byteswap(cnt);
+    offset += sizeof(uint16_t);
     if(count == 0) {
+        // An empty index consists only of the count.
         return index;
     }
-    offset += sizeof(uint16_t);
     ERC(offSize, extract<uint8_t>(dataspan, offset));
     ++offset;
     std::vector<size_t> offsets;
@@ -201,11 +204,11 @@ rvoe<CFFDict> unpack_dictionary(std::span<std::byte> dataspan_orig) {
                 const int32_t b4 = (uint8_t)dataspan.at(offset++);
                 unpacked_operand = b1 << 24 | b2 << 16 | b3 << 8 | b4;
             } else if(b0 == 30) {
-                // Floating point.
+                // Floating point. Two digits per byte, terminated by a nibble with all bits set.
                 uint8_t b1;
                 do {
                     b1 = (uint8_t)dataspan.at(offset++);
-                } while((b1 & 0xf) != 0xf);
+                } while((b1 & 0xf) != 0xf && (b1 >> 4) != 0xf);
                 unpacked_operand = -1; // FIXME
             } else {
                 std::abort();
@@ -267,13 +270,19 @@ rvoe<std::vector<CFFSelectRange3>> unpack_fdselect(std::span<std::byte> dataspan
                                                    uint32_t num_glyphs) {
     std::vector<CFFSelectRange3> ranges;
     size_t offset = 0;
+    if(dataspan.empty()) {
+        RETERR(MalformedFontFile);
+    }
     const uint8_t format = (uint8_t)dataspan[offset++];
     if(format == 0) {
-        std::vector<std::byte> selector_array{dataspan.begin() + offset,
-                                              dataspan.begin() + offset + num_glyphs};
-        // FIXME. OR maybe not. This seems to be used in generated
-        // subset fonts only.
-        return ranges;
+        // One font dictionary number for each glyph. Stored as ranges, like format 3.
+        ERC(selector_array, safe_subspan(dataspan, offset, num_glyphs));
+        for(uint32_t i = 0; i < num_glyphs; ++i) {
+            const auto fd = (uint8_t)selector_array[i];
+            if(ranges.empty() || ranges.back().fd != fd) {
+                ranges.push_back(CFFSelectRange3{(uint16_t)i, fd});
+            }
+        }
     } else if(format == 3) {
         ERC(nRg, extract_and_swap<uint16_t>(dataspan, offset));
         const uint32_t nRanges = nRg;
@@ -287,6 +296,17 @@ rvoe<std::vector<CFFSelectRange3>> unpack_fdselect(std::span<std::byte> dataspan
         }
         ERC(sentinel, extract_and_swap<uint16_t>(dataspan, offset));
         if(sentinel != num_glyphs) {
+            RETERR(MalformedFontFile);
+        }
+    } else {
+        RETERR(UnsupportedFormat);
+    }
+    // Looking up the font dictionary of a glyph relies on these.
+    if(num_glyphs > 0 && (ranges.empty() || ranges.front().first != 0)) {
+        RETERR(MalformedFontFile);
+    }
+    for(size_t i = 1; i < ranges.size(); ++i) {
+        if(ranges[i].first <= ranges[i - 1].first) {
             RETERR(MalformedFontFile);
         }
     }
@@ -477,6 +497,12 @@ rvoe<CFFont> parse_cff_data(DataSource source) {
     if(false) {
         print_info(f);
     }
+    if(auto *cst = find_command(f, DictOperator::CharstringType)) {
+        // Only Type 2 charstrings (the default) are supported.
+        if(cst->operand.size() != 1 || cst->operand.front() != 2) {
+            RETERR(UnsupportedFormat);
+        }
+    }
     auto *cse = find_command(f, DictOperator::CharStrings);
     if(!cse) {
         RETERR(UnsupportedFormat);
@@ -507,12 +533,13 @@ rvoe<CFFont> parse_cff_data(DataSource source) {
 
     auto *priv = find_command(f, DictOperator::Private);
     if(priv) {
-        if(priv->operand.empty()) {
+        if(priv->operand.size() != 2 || priv->operand[0] < 0 || priv->operand[1] < 0) {
             RETERR(MalformedFontFile);
         }
         auto dict_offset = priv->operand[1];
         auto dict_size = priv->operand[0];
-        ERC(raw_pdict, unpack_dictionary(dataspan.subspan(dict_offset, dict_size)));
+        ERC(pdict_span, safe_subspan(dataspan, dict_offset, dict_size));
+        ERC(raw_pdict, unpack_dictionary(pdict_span));
         ERC(processed_pdict, build_pdict_from_dict(dataspan, dict_offset, raw_pdict));
         f.pdict = std::move(processed_pdict);
     }
@@ -564,19 +591,17 @@ void append_ros_strings(CFFont &f) {
 
 uint8_t CFFont::get_fontdict_id(uint16_t glyph_id) const {
     if(!is_cid) {
-        return glyph_id;
+        return 0;
     }
     assert(!fdselect.empty());
-    for(size_t i = 0; i < fdselect.size(); ++i) {
-        if(fdselect[i].first == glyph_id) {
-            return fdselect[i].fd;
-        }
-        if(fdselect[i].first > glyph_id) {
-            assert(i > 0);
-            return fdselect[i - 1].fd;
-        }
-    }
-    return fdselect.back().fd;
+    // The ranges are in ascending order and the first one starts from zero.
+    // Find the last one that starts at or before the glyph.
+    auto it = std::upper_bound(
+        fdselect.begin(), fdselect.end(), glyph_id, [](uint16_t gid, const CFFSelectRange3 &r) {
+            return gid < r.first;
+        });
+    assert(it != fdselect.begin());
+    return std::prev(it)->fd;
 }
 
 rvoe<CFFont> parse_cff_file(const char *fname) {
