@@ -114,9 +114,8 @@ rvoe<NoReturnValue> CommandStreamFormatter::indent(DrawStateType stype) {
     if(stype == DrawStateType::Text && has_state(stype)) {
         RETERR(DrawStateEndMismatch); // FIXME
     }
-    if(stype == DrawStateType::MarkedContent && has_state(stype)) {
-        RETERR(NestedBMC);
-    }
+    // Marked content may nest (ISO 32000-2, 14.6), e.g. the marked content of a structure item
+    // inside that of an optional content group.
     stack.push_back(stype);
     lead += "  ";
     RETOK;
