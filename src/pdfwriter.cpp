@@ -1199,10 +1199,23 @@ rvoe<NoReturnValue> PdfWriter::write_delayed_structure_item(int obj_num,
         // either has children or is used on a page. Not both.
         const auto it = doc.structure_use.find(dsi.sid);
         if(it != doc.structure_use.end()) {
-            const auto &[page_num, mcid_num] = it->second;
-            fmt.add_token("/Pg");
-            fmt.add_object_ref(doc.pages.at(page_num).page_obj_num);
-            fmt.add_token_pair("/K", mcid_num);
+            const auto &[page_num, mcid_num, stm_obj] = it->second;
+            if(page_num >= 0) {
+                fmt.add_token("/Pg");
+                fmt.add_object_ref(doc.pages.at(page_num).page_obj_num);
+            }
+            if(stm_obj) {
+                // 14.7.5.3: marked content in a form XObject (a transparency group)
+                fmt.add_token("/K");
+                fmt.begin_dict();
+                fmt.add_token_pair("/Type", "/MCR");
+                fmt.add_token("/Stm");
+                fmt.add_object_ref(*stm_obj);
+                fmt.add_token_pair("/MCID", mcid_num);
+                fmt.end_dict();
+            } else {
+                fmt.add_token_pair("/K", mcid_num);
+            }
         }
     }
 

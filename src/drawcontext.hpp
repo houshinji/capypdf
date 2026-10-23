@@ -185,6 +185,9 @@ public:
     const std::vector<CapyPDF_StructureItemId> &get_structure_usage() const {
         return used_structures;
     }
+    const std::unordered_set<CapyPDF_TransparencyGroupId> &get_trgroup_usage() const {
+        return used_trgroups;
+    }
 
     const std::optional<Transition> &get_transition() const { return transition; }
 

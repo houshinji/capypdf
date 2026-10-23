@@ -539,7 +539,8 @@ rvoe<NoReturnValue> PdfDocument::add_page(std::string resource_dict,
                                           const std::vector<CapyPDF_StructureItemId> &structs,
                                           const std::optional<Transition> &transition,
                                           const std::vector<SubPageNavigation> &subnav,
-                                          const std::vector<Viewport> &viewports) {
+                                          const std::vector<Viewport> &viewports,
+                                          const std::unordered_set<CapyPDF_TransparencyGroupId> &trgroups) {
     for(const auto &a : annots) {
         if(annotation_use.find(a) != annotation_use.cend()) {
             RETERR(AnnotationReuse);
@@ -582,10 +583,30 @@ rvoe<NoReturnValue> PdfDocument::add_page(std::string resource_dict,
     }
     int32_t mcid_num = 0;
     for(const auto &s : structs) {
-        structure_use[s] = StructureUsage{(int32_t)pages.size(), mcid_num++};
+        structure_use[s] = StructureUsage{(int32_t)pages.size(), mcid_num++, {}};
+    }
+    for(const auto &tg : trgroups) {
+        place_transparency_group_structures(tg, (int32_t)pages.size());
     }
     pages.emplace_back(PageOffsets{resource_num, commands_num, page_object_num});
     RETOK;
+}
+
+// The structure items in a transparency group (and in the groups it draws) are on the first page
+// that draws it.
+void PdfDocument::place_transparency_group_structures(CapyPDF_TransparencyGroupId trid,
+                                                      int32_t page_num) {
+    const auto &content = transparency_group_contents.at(trid.id);
+    for(const auto &s : content.structs) {
+        auto &use = structure_use.at(s);
+        if(use.page_num >= 0) {
+            return; // placed by an earlier page, and so is the rest
+        }
+        use.page_num = page_num;
+    }
+    for(const auto &tg : content.trgroups) {
+        place_transparency_group_structures(tg, page_num);
+    }
 }
 
 rvoe<NoReturnValue>
@@ -2121,11 +2142,29 @@ rvoe<CapyPDF_TransparencyGroupId> PdfDocument::add_transparency_group(PdfDrawCon
     if(ctx.marked_content_depth() != 0) {
         RETERR(UnclosedMarkedContent);
     }
+    const auto &structs = ctx.get_structure_usage();
+    for(const auto &s : structs) {
+        if(structure_use.find(s) != structure_use.cend()) {
+            RETERR(StructureReuse);
+        }
+    }
     ERC(sc_var, ctx.serialize());
     auto &d = std::get<SerializedXObject>(sc_var);
     auto objid =
         add_object(DeflatePDFObject{std::move(d.dict), RawData(std::move(d.command_stream)), true});
     transparency_groups.push_back(objid);
+    TransparencyGroupContent content;
+    content.trgroups.assign(ctx.get_trgroup_usage().cbegin(), ctx.get_trgroup_usage().cend());
+    if(!structs.empty()) {
+        // The key serialize() wrote into the group's /StructParents
+        structure_parent_tree_items.push_back(structs);
+        int32_t mcid_num = 0;
+        for(const auto &s : structs) {
+            structure_use[s] = StructureUsage{-1, mcid_num++, objid};
+        }
+        content.structs = structs;
+    }
+    transparency_group_contents.push_back(std::move(content));
     return CapyPDF_TransparencyGroupId{(int32_t)transparency_groups.size() - 1};
 }
 

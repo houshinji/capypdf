@@ -365,8 +365,15 @@ struct StructItem {
 };
 
 struct StructureUsage {
-    int32_t page_num;
+    int32_t page_num; // -1: in a transparency group that no page has drawn (yet)
     int32_t mcid_num;
+    std::optional<int32_t> stm_obj; // the transparency group's object, if the content is in one
+};
+
+// The structure items and the transparency groups that a transparency group's content holds.
+struct TransparencyGroupContent {
+    std::vector<CapyPDF_StructureItemId> structs;
+    std::vector<CapyPDF_TransparencyGroupId> trgroups;
 };
 
 typedef std::variant<DummyIndexZero,
@@ -459,7 +466,8 @@ public:
                                  const std::vector<CapyPDF_StructureItemId> &structs,
                                  const std::optional<Transition> &transition,
                                  const std::vector<SubPageNavigation> &subnav,
-                                 const std::vector<Viewport> &viewports);
+                                 const std::vector<Viewport> &viewports,
+                                 const std::unordered_set<CapyPDF_TransparencyGroupId> &trgroups = {});
 
     rvoe<NoReturnValue> add_page_labeling(uint32_t start_page,
                                           std::optional<CapyPDF_Page_Label_Number_Style> style,
@@ -628,6 +636,7 @@ private:
     std::vector<StructItem> structure_items;
     std::vector<int32_t> ocg_items;
     std::vector<int32_t> transparency_groups;
+    std::vector<TransparencyGroupContent> transparency_group_contents; // as transparency_groups
     std::vector<int32_t> soft_masks;
     std::vector<FunctionInfo> functions;
     std::vector<ShadingInfo> shadings;
@@ -638,6 +647,7 @@ private:
     // A form widget can be used on one and only one page.
     std::unordered_map<CapyPDF_AnnotationId, int32_t> annotation_use;
     std::unordered_map<CapyPDF_StructureItemId, StructureUsage> structure_use;
+    void place_transparency_group_structures(CapyPDF_TransparencyGroupId trid, int32_t page_num);
     std::vector<std::vector<CapyPDF_StructureItemId>>
         structure_parent_tree_items; // FIXME should be a variant of some sort?
     std::optional<CapyPDF_IccColorSpaceId> output_profile;

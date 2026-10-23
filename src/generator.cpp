@@ -104,7 +104,8 @@ rvoe<PageId> PdfGen::add_page(PdfDrawContext &ctx) {
                        ctx.get_structure_usage(),
                        ctx.get_transition(),
                        ctx.get_subpage_navigation(),
-                       ctx.get_viewport()));
+                       ctx.get_viewport(),
+                       ctx.get_trgroup_usage()));
     ctx.clear();
     return PageId{(int32_t)pdoc.pages.size() - 1};
 }

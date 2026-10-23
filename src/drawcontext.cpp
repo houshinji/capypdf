@@ -80,6 +80,12 @@ rvoe<DCSerialization> PdfDrawContext::serialize() {
         if(group_matrix) {
             write_matrix(fmt, group_matrix.value());
         }
+        if(!used_structures.empty()) {
+            // Structure items whose marked content is in this group (14.7.5.3): the key of the
+            // group in the parent tree, which PdfDocument::add_transparency_group() adds next.
+            fmt.add_token_pair("/StructParents",
+                               (int32_t)doc->structure_parent_tree_items.size());
+        }
         fmt.add_token("/Resources");
         build_resource_dict(fmt);
         ERC(commands, cmds.steal());
