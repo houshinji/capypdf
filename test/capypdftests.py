@@ -189,6 +189,56 @@ class TestPDFCreation(unittest.TestCase):
                     ctx.scale(80, 80)
                     ctx.cmd_Do(rgb_tif_img)
 
+    @validate_image('python_tiffalpha', 200, 100)
+    def test_tiff_alpha(self, ofilename, w, h):
+        import tempfile
+        # Every pixel has its own alpha value. Both images are
+        # fully opaque in the top left and fully transparent in the
+        # bottom right pixel, so the checker background shows through there.
+        size = 4
+        rgba = PIL.Image.new('RGBA', (size, size))
+        gray_alpha = PIL.Image.new('LA', (size, size))
+        for y in range(size):
+            for x in range(size):
+                alpha = 255 - (x + y) * 255 // (2 * size - 2)
+                rgba.putpixel((x, y), (255, 0, 0, alpha) if x < size // 2 else (0, 0, 255, alpha))
+                gray_alpha.putpixel((x, y), (0 if y < size // 2 else 128, alpha))
+        dprops = capypdf.DocumentProperties()
+        pprops = capypdf.PageProperties()
+        pprops.set_pagebox(capypdf.PageBox.Media, 0, 0, w, h)
+        dprops.set_default_page_properties(pprops)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rgba_file = pathlib.Path(tmpdir) / 'rgba.tif'
+            ga_file = pathlib.Path(tmpdir) / 'gray_alpha.tif'
+            rgba.save(rgba_file)
+            gray_alpha.save(ga_file)
+            with capypdf.Generator(ofilename, dprops) as g:
+                params = capypdf.ImagePdfProperties()
+                rgba_img = g.add_image(g.load_image(rgba_file), params)
+                ga_img = g.add_image(g.load_image(ga_file), params)
+                with g.page_draw_context() as ctx:
+                    ctx.cmd_rg(0, 0.7, 0)
+                    ctx.cmd_re(0, 0, w, h)
+                    ctx.cmd_f()
+                    with ctx.push_gstate():
+                        ctx.translate(10, 10)
+                        ctx.scale(80, 80)
+                        ctx.cmd_Do(rgba_img)
+                    with ctx.push_gstate():
+                        ctx.translate(110, 10)
+                        ctx.scale(80, 80)
+                        ctx.cmd_Do(ga_img)
+
+    def test_load_missing_image(self):
+        ofile = pathlib.Path('delme_missing_image.pdf')
+        for name in ['no_such_image.png', 'no_such_image.tif', 'no_such_image.xyz', 'no_such_image']:
+            with self.subTest(name=name):
+                g = capypdf.Generator(ofile)
+                with self.assertRaises(capypdf.CapyPDFException):
+                    g.load_image(image_dir / name)
+                g = None
+        self.assertFalse(ofile.exists())
+
     @validate_image('python_path', 200, 200)
     def test_path(self, ofilename, w, h):
         dprops = capypdf.DocumentProperties()

@@ -257,7 +257,7 @@ void separate_tif_alpha(RawPixelImage &image, const size_t num_color_channels) {
         for(size_t j = 0; j < num_color_channels; ++j) {
             colors.push_back(image.pixels[i + j]);
         }
-        image.alpha.push_back(image.pixels[num_color_channels]);
+        image.alpha.push_back(image.pixels[i + num_color_channels]);
     }
     image.pixels = std::move(colors);
 }
@@ -618,6 +618,9 @@ rvoe<RasterImage> load_image_file(const char *fname) {
     char buf[bufsize];
     buf[0] = 0;
     FILE *f = fopen(fname, "rb");
+    if(!f) {
+        RETERR(CouldNotOpenFile);
+    }
     auto rc = fread(buf, 1, bufsize, f);
     fclose(f);
     if(rc != bufsize) {
