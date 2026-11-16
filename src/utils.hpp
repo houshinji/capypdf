@@ -7,6 +7,7 @@
 #include <pdfcommon.hpp>
 #include <string>
 #include <cstdio>
+#include <filesystem>
 #include <string_view>
 #include <vector>
 
@@ -31,6 +32,14 @@ rvoe<std::vector<std::byte>> load_file_as_bytes(const std::string &fname);
 rvoe<std::vector<std::byte>> load_file_as_bytes(FILE *f);
 
 void write_file(const char *ofname, const char *buf, size_t bufsize);
+
+// File names that capypdf gets from its API are UTF-8. On Windows the narrow file functions
+// (fopen, std::filesystem::path(const char *)) read them in the ANSI code page instead, and a
+// name with, say, Japanese letters in it cannot be opened. These convert the name to the
+// native (UTF-16) form there; elsewhere they are the plain calls.
+std::filesystem::path path_from_utf8(const char *utf8_name);
+std::string path_to_utf8(const std::filesystem::path &path);
+FILE *fopen_utf8(const char *utf8_name, const char *mode);
 
 std::string utf8_to_pdfutf16be(const u8string &input, bool add_adornments = true);
 

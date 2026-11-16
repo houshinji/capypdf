@@ -72,7 +72,7 @@ std::string_view MMapper::sv() const { return d->sv(); }
 #ifdef _WIN32
 
 rvoe<MMapper> mmap_file(const char *fname) {
-    HANDLE file_handle = CreateFile(fname,
+    HANDLE file_handle = CreateFileW(path_from_utf8(fname).c_str(),
                                     GENERIC_READ,
                                     FILE_SHARE_READ,
                                     nullptr,

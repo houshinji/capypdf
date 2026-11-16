@@ -227,9 +227,15 @@ rvoe<NoReturnValue> PdfWriter::write_to_file(const char *ofilename) {
         RETERR(WritingTwice);
     }
     doc.write_attempted = true;
-    std::filesystem::path tempfname(ofilename);
+    // The name is UTF-8; on Windows that must not be read as the ANSI code page (utils.hpp).
+    const std::filesystem::path outpath = path_from_utf8(ofilename);
+    std::filesystem::path tempfname(outpath);
     tempfname.replace_extension(".pdf~");
+#ifdef _WIN32
+    FILE *out_file = _wfopen(tempfname.c_str(), L"wb");
+#else
     FILE *out_file = fopen(tempfname.string().c_str(), "wb");
+#endif
     if(!out_file) {
         perror(nullptr);
         RETERR(CouldNotOpenFile);
@@ -261,7 +267,7 @@ rvoe<NoReturnValue> PdfWriter::write_to_file(const char *ofilename) {
 
     // If we made it here, the file has been fully written and fsync'd to disk. Now replace.
     std::error_code ec;
-    std::filesystem::rename(tempfname, ofilename, ec);
+    std::filesystem::rename(tempfname, outpath, ec);
     if(ec) {
         fprintf(stderr, "%s\n", ec.category().message(ec.value()).c_str());
         RETERR(FileWriteError);

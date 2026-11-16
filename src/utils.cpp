@@ -152,8 +152,37 @@ rvoe<std::vector<std::byte>> flate_compress(std::span<std::byte> data) {
     return flate_compress(sv);
 }
 
+std::filesystem::path path_from_utf8(const char *utf8_name) {
+#ifdef _WIN32
+    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t *>(utf8_name)));
+#else
+    return std::filesystem::path(utf8_name);
+#endif
+}
+
+std::string path_to_utf8(const std::filesystem::path &path) {
+#ifdef _WIN32
+    const auto u8 = path.u8string();
+    return std::string(reinterpret_cast<const char *>(u8.data()), u8.size());
+#else
+    return path.string();
+#endif
+}
+
+FILE *fopen_utf8(const char *utf8_name, const char *mode) {
+#ifdef _WIN32
+    std::wstring wide_mode;
+    for(const char *c = mode; *c; ++c) {
+        wide_mode.push_back(static_cast<wchar_t>(*c));
+    }
+    return _wfopen(path_from_utf8(utf8_name).c_str(), wide_mode.c_str());
+#else
+    return fopen(utf8_name, mode);
+#endif
+}
+
 rvoe<std::string> load_file_as_string(const char *fname) {
-    FILE *f = fopen(fname, "rb");
+    FILE *f = fopen_utf8(fname, "rb");
     if(!f) {
         perror(nullptr);
         RETERR(CouldNotOpenFile);
@@ -165,7 +194,7 @@ rvoe<std::string> load_file_as_string(const char *fname) {
 rvoe<std::string> load_file_as_string(FILE *f) { return do_file_load<std::string>(f); }
 
 rvoe<std::vector<std::byte>> load_file_as_bytes(const std::string &fname) {
-    FILE *f = fopen(fname.c_str(), "rb");
+    FILE *f = fopen_utf8(fname.c_str(), "rb");
     if(!f) {
         perror(nullptr);
         RETERR(CouldNotOpenFile);
@@ -179,7 +208,7 @@ rvoe<std::vector<std::byte>> load_file_as_bytes(FILE *f) {
 }
 
 void write_file(const char *ofname, const char *buf, size_t bufsize) {
-    FILE *f = fopen(ofname, "wb");
+    FILE *f = fopen_utf8(ofname, "wb");
     if(!f) {
         std::abort();
     }

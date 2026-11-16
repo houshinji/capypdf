@@ -461,7 +461,7 @@ rvoe<RasterImage> load_png_file(FILE *f) {
 }
 
 rvoe<RasterImage> load_png_file(const char *fname) {
-    FILE *f = fopen(fname, "rb");
+    FILE *f = fopen_utf8(fname, "rb");
     if(!f) {
         RETERR(CouldNotOpenFile);
     }
@@ -578,7 +578,7 @@ rvoe<jpg_image> load_jpg_metadata(FILE *f, const char *buf, int64_t bufsize) {
 }
 
 rvoe<jpg_image> load_jpg_file(const char *fname) {
-    FILE *f = fopen(fname, "rb");
+    FILE *f = fopen_utf8(fname, "rb");
     if(!f) {
         RETERR(FileDoesNotExist);
     }
@@ -599,7 +599,7 @@ rvoe<jpg_image> load_jpg_from_memory(const char *buf, int64_t bufsize) {
 } // namespace
 
 rvoe<RasterImage> load_image_file(const char *fname) {
-    std::filesystem::path fobj(fname);
+    std::filesystem::path fobj = path_from_utf8(fname);
     auto extension = fobj.extension();
     if(extension == ".png" || extension == ".PNG") {
         return load_png_file(fname);
@@ -617,7 +617,7 @@ rvoe<RasterImage> load_image_file(const char *fname) {
     const size_t bufsize = 10;
     char buf[bufsize];
     buf[0] = 0;
-    FILE *f = fopen(fname, "rb");
+    FILE *f = fopen_utf8(fname, "rb");
     if(!f) {
         RETERR(CouldNotOpenFile);
     }

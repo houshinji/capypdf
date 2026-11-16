@@ -3012,8 +3012,8 @@ CAPYPDF_PUBLIC CapyPDF_EC capy_embedded_file_load_file(CapyPDF_EmbeddedFile *efi
                                                        const char *path) CAPYPDF_NOEXCEPT {
     API_BOUNDARY_START;
     auto *eobj = static_cast<EmbeddedFile *>(efile);
-    std::filesystem::path fspath(path);
-    auto pathless_name = fspath.filename().string();
+    const std::filesystem::path fspath = path_from_utf8(path);
+    auto pathless_name = path_to_utf8(fspath.filename());
 
     auto urc = validate_utf8(pathless_name.c_str(), pathless_name.size());
     if(!urc) {
